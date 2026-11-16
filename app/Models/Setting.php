@@ -12,4 +12,10 @@ class Setting extends Model
     {
         return ['value' => 'json'];
     }
+
+    // Setting::get('extra_cleaner_fee_k', 0)
+    public static function get(string $name, mixed $default = null): mixed
+    {
+        return static::where('name', $name)->first()?->value ?? $default;
+    }
 }
