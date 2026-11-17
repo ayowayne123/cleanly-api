@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\Booking;
 use App\Models\BookingCleaner;
 use App\Models\Cleaner;
 use App\Models\CleanerTimeOff;
@@ -16,6 +17,12 @@ use Illuminate\Support\Str;
 
 class AvailabilityService
 {
+
+    // Bookings in these statuses are holding a day for their crew
+    private const SLOT_HOLDING_STATUSES = [
+        'pending_payment', 'awaiting_assignment', 'assigned', 'confirmed', 'in_progress',
+    ];
+
     /**
      * Why a cleaner can't work on a date, or null if they can (section 3.2).
      * Reasons: inactive, closed_day, off_day, time_off, booked.
@@ -75,12 +82,15 @@ class AvailabilityService
             ->values();
     }
 
-    /**
+      /**
      * For the date picker: every open work day in the range, how many cleaners are free,
-     * and whether there are enough for the crew this job needs.
+     * how many crew places are really open, and whether this job fits.
+     *
+     * open_slots = free cleaners minus crew places still unfilled on bookings already holding
+     * that day. Without that, five one-cleaner bookings would all "fit" into two free cleaners.
      * (Zone is only a preference, so every free active cleaner counts.)
      *
-     * @return Collection<int, array{date:string, opens_at:string, available_cleaners:int, bookable:bool}>
+     * @return Collection<int, array{date:string, opens_at:string, available_cleaners:int, open_slots:int, bookable:bool}>
      */
     public function bookableDates(CarbonInterface|string $from, CarbonInterface|string $to, int $cleanersRequired): Collection
     {
@@ -99,15 +109,26 @@ class AvailabilityService
             $days->map(fn (WorkDay $d) => $d->work_date->toDateString())->all(),
         );
 
-        return $days->map(function (WorkDay $day) use ($cleaners, $unavailable, $cleanersRequired) {
+        $unfilled = Booking::whereIn('work_day_id', $days->pluck('id'))
+            ->whereIn('status', self::SLOT_HOLDING_STATUSES)
+            ->withCount('activeAssignments')
+            ->get()
+            ->groupBy('work_day_id')
+            ->map(fn ($bookings) => $bookings->sum(
+                fn (Booking $b) => max(0, $b->cleaners_required - $b->active_assignments_count)
+            ));
+
+        return $days->map(function (WorkDay $day) use ($cleaners, $unavailable, $unfilled, $cleanersRequired) {
             $key = $day->work_date->toDateString();
             $free = $cleaners->filter(fn (Cleaner $c) => ! isset($unavailable[$c->id][$key]))->count();
+            $open = max(0, $free - (int) ($unfilled[$day->id] ?? 0));
 
             return [
                 'date' => $key,
                 'opens_at' => substr((string) $day->opens_at, 0, 5),
                 'available_cleaners' => $free,
-                'bookable' => $free >= $cleanersRequired,
+                'open_slots' => $open,
+                'bookable' => $open >= $cleanersRequired,
             ];
         });
     }
