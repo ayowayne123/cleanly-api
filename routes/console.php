@@ -10,3 +10,4 @@ Artisan::command('inspire', function () {
 
 Schedule::command('work-days:generate')->daily();
 Schedule::command('bookings:expire-unpaid')->everyFiveMinutes();
+Schedule::command('subscriptions:process')->hourly()->withoutOverlapping();
