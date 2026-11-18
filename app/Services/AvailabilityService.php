@@ -23,6 +23,32 @@ class AvailabilityService
         'pending_payment', 'awaiting_assignment', 'assigned', 'confirmed', 'in_progress',
     ];
 
+        /**
+     * Why a cleaner can no longer do a job on this date, ignoring their own bookings:
+     * inactive, off_day or time_off. Null means nothing stands in their way.
+     * Used to find jobs that need a replacement after leave is approved or an off day changes.
+     */
+    public function standingConflict(Cleaner $cleaner, CarbonInterface|string $date): ?string
+    {
+        $day = $this->dateString($date);
+
+        if ($cleaner->status !== 'active') {
+            return 'inactive';
+        }
+
+        if ($cleaner->weekly_off_day !== null && (int) $cleaner->weekly_off_day === Carbon::parse($day)->dayOfWeek) {
+            return 'off_day';
+        }
+
+        $onLeave = CleanerTimeOff::approved()
+            ->where('cleaner_id', $cleaner->id)
+            ->whereDate('start_date', '<=', $day)
+            ->whereDate('end_date', '>=', $day)
+            ->exists();
+
+        return $onLeave ? 'time_off' : null;
+    }
+    
     /**
      * Why a cleaner can't work on a date, or null if they can (section 3.2).
      * Reasons: inactive, closed_day, off_day, time_off, booked.
