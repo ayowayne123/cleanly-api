@@ -248,4 +248,149 @@ class BookingService
             throw new BookingException('Please choose a date for the cleaning.');
         }
     }
+
+        // =====================================================================
+    // Rescheduling
+    // =====================================================================
+
+    private const RESCHEDULABLE = ['pending_payment', 'awaiting_assignment', 'assigned', 'confirmed'];
+
+    /**
+     * Move a booking to another open work day (the same week or another week).
+     * Cleaners who are free on the new day stay on the job (an accepted job must be accepted again);
+     * the others are taken off it. Nothing is charged or refunded: the payment status is unchanged.
+     *
+     * @throws BookingException
+     */
+    public function reschedule(Booking|int $booking, string $newDate, ?User $by = null, ?string $reason = null): Booking
+    {
+        $id = $booking instanceof Booking ? $booking->id : $booking;
+        $date = $this->parseDate($newDate);
+
+        try {
+            return DB::transaction(function () use ($id, $date, $by, $reason) {
+                $booking = Booking::with('workDay')->whereKey($id)->lockForUpdate()->firstOrFail();
+
+                if (! in_array($booking->status, self::RESCHEDULABLE, true) || $booking->start_at->isPast()) {
+                    throw new BookingException('This booking can no longer be moved.');
+                }
+
+                $this->assertNotice($booking, $by);
+
+                if ($booking->workDay->work_date->isSameDay($date)) {
+                    throw new BookingException('The booking is already on that date.');
+                }
+
+                $newDay = $this->lockBookableDay($date, (int) $booking->cleaners_required, $booking->subscription_id);
+
+                $oldDayId = $booking->work_day_id;
+                $oldDate = $booking->workDay->work_date->toDateString();
+                $start = $newDay->work_date->copy()->setTimeFromTimeString($newDay->opens_at);
+                $end = $start->copy()->addMinutes($booking->est_duration_minutes);
+
+                // keep the cleaners who are free on the new day, take the others off
+                $assignments = $booking->assignments()
+                    ->whereIn('status', ['offered', 'accepted', 'assigned'])
+                    ->with('cleaner')
+                    ->get();
+
+                foreach ($assignments as $assignment) {
+                    if ($this->availability->unavailabilityReason($assignment->cleaner, $newDay->work_date) === null) {
+                        $reaccept = $assignment->status === 'accepted';
+
+                        // the model keeps active_work_date in step, so the cleaner's old day is freed
+                        $assignment->update([
+                            'work_date' => $newDay->work_date->toDateString(),
+                            'start_at' => $start,
+                            'end_at' => $end,
+                            'status' => $reaccept ? 'offered' : $assignment->status,
+                            'responded_at' => $reaccept ? null : $assignment->responded_at,
+                        ]);
+                    } else {
+                        $assignment->update(['status' => 'removed', 'replacement_reason' => 'admin_change']);
+                    }
+                }
+
+                $booking->update([
+                    'work_day_id' => $newDay->id,
+                    // remember the FIRST original day, so a subscription visit is never recreated there
+                    'rescheduled_from_work_day_id' => $booking->rescheduled_from_work_day_id ?? $oldDayId,
+                    'rescheduled_at' => now(),
+                    'start_at' => $start,
+                    'end_at' => $end,
+                ]);
+
+                $note = 'Moved from '.$oldDate.' to '.$date->toDateString().($reason ? ': '.$reason : '');
+                $booking->refresh();
+                $target = $booking->status;
+
+                if (in_array($booking->status, ['awaiting_assignment', 'assigned', 'confirmed'], true)) {
+                    $target = $booking->isFullyStaffed() ? 'assigned' : 'awaiting_assignment';
+                }
+
+                if ($target !== $booking->status) {
+                    $booking->changeStatus($target, $by, $note);
+                } else {
+                    $booking->statusHistory()->create([
+                        'from_status' => $booking->status,
+                        'to_status' => $booking->status,
+                        'changed_by_user_id' => $by?->id,
+                        'note' => $note,
+                    ]);
+                }
+
+                return $booking->fresh(['workDay']);
+            });
+        } catch (\Illuminate\Database\UniqueConstraintViolationException) {
+            // another admin put a cleaner on that day at the same moment: the database refused the double booking
+            throw new BookingException('Someone was assigned to that day at the same moment. Please try again.');
+        }
+    }
+
+    /**
+     * Lock a work day and make sure a booking with this crew size can go on it.
+     * Call it inside a database transaction. Used when moving a booking and when scheduling a make-up visit.
+     *
+     * @throws BookingException
+     */
+    public function lockBookableDay(Carbon $date, int $cleanersRequired, ?int $subscriptionId = null): WorkDay
+    {
+        $earliest = today()->addDays(max(0, (int) Setting::get('min_lead_days', 1)));
+
+        if ($date->lt($earliest)) {
+            throw new BookingException('That date is too soon. Please choose a later date.');
+        }
+
+        $day = WorkDay::whereDate('work_date', $date->toDateString())->lockForUpdate()->first();
+
+        if (! $day || ! $day->is_open) {
+            throw new BookingException('We are not taking bookings on that date.');
+        }
+
+        // a subscriber cannot have two visits on one day
+        if ($subscriptionId && Booking::where('subscription_id', $subscriptionId)
+            ->where('work_day_id', $day->id)
+            ->whereNotIn('status', ['cancelled', 'expired'])
+            ->exists()) {
+            throw new BookingException('This subscription already has a visit on that date.');
+        }
+
+        $slot = $this->availability->bookableDates($date, $date, $cleanersRequired)->first();
+
+        if (! $slot || ! $slot['bookable']) {
+            throw new BookingException('Sorry, that date is fully booked. Please choose another.');
+        }
+
+        return $day;
+    }
+
+    // clients must give `reschedule_notice_hours` of notice (default 0 = none); admin can always move a booking
+    private function assertNotice(Booking $booking, ?User $by): void
+    {
+        $hours = (int) Setting::get('reschedule_notice_hours', 0);
+
+        if ($hours > 0 && ! ($by && $by->isAdmin()) && now()->diffInHours($booking->start_at, false) < $hours) {
+            throw new BookingException("Changes need at least {$hours} hours' notice. Please contact us.");
+        }
+    }
 }

@@ -314,13 +314,14 @@ class SubscriptionService
             $key = $date->toDateString();
             $day = $days->get($key);
 
-            // a closed day (or no work day yet) cannot be cleaned: report it for admin
-            if (! $day || ! $day->is_open) {
-                $summary['skipped_dates'][] = $key;
+                       // already has a visit, or its visit was moved to another day
+            if ($day && $this->visitExists($sub, $day)) {
                 continue;
             }
 
-            if ($this->visitExists($sub, $day)) {
+            // a closed day (or no work day yet) cannot be cleaned: report it so admin can schedule a make-up visit
+            if (! $day || ! $day->is_open) {
+                $summary['skipped_dates'][] = $key;
                 continue;
             }
 
@@ -416,13 +417,13 @@ class SubscriptionService
     private function visitExists(Subscription $sub, WorkDay $day): bool
     {
         return Booking::where('subscription_id', $sub->id)
-            ->where('work_day_id', $day->id)
+            // the visit is on this day, or it was moved away from it
+            ->where(fn ($q) => $q->where('work_day_id', $day->id)->orWhere('rescheduled_from_work_day_id', $day->id))
             ->where('status', '!=', 'expired')
             // a visit cancelled for non-payment may be recreated; one the client cancelled may not
             ->where(fn ($q) => $q->whereNull('cancel_reason')->orWhere('cancel_reason', '!=', self::PAYMENT_FAILED_REASON))
             ->exists();
     }
-
     // =====================================================================
     // Staffing a visit (section 3.8)
     // =====================================================================
@@ -921,6 +922,133 @@ class SubscriptionService
         return $cancelled;
     }
 
+        // =====================================================================
+    // Rescheduling (a paid visit that cannot happen is moved, never refunded)
+    // =====================================================================
+
+    /**
+     * Move an existing visit to another open day, in the same week or another week.
+     * Usual-crew cleaners who are free that day stay on it; the empty places are refilled
+     * (usual crew first, then stand-ins).
+     *
+     * @throws SubscriptionException
+     */
+    public function rescheduleVisit(Booking|int $visit, string $newDate, ?User $by = null, ?string $reason = null): Booking
+    {
+        $booking = Booking::findOrFail($visit instanceof Booking ? $visit->id : $visit);
+
+        if (! $booking->subscription_id) {
+            throw new SubscriptionException('That booking is not part of a subscription.');
+        }
+
+        $sub = Subscription::findOrFail($booking->subscription_id);
+        $this->assertRunning($sub);
+        $this->assertWithinEnd($sub, $this->parseDay($newDate));
+
+        try {
+            $this->bookings->reschedule($booking, $newDate, $by, $reason);
+        } catch (BookingException $e) {
+            throw new SubscriptionException($e->getMessage(), 0, $e);
+        }
+
+        DB::transaction(fn () => $this->staffVisit($booking->refresh()->load('workDay'), $sub));
+
+        return $booking->fresh();
+    }
+
+    /**
+     * A visit date that is closed (a public holiday) has no visit to move, so create its make-up visit
+     * on another open day. It is marked as moved from the closed date, so that date is not reported again.
+     *
+     * @throws SubscriptionException
+     */
+    public function scheduleMakeUp(
+        Subscription|int $subscription,
+        string $closedDate,
+        string $newDate,
+        ?User $by = null,
+        ?string $reason = null,
+    ): Booking {
+        $sub = Subscription::with('slots')->findOrFail($subscription instanceof Subscription ? $subscription->id : $subscription);
+        $this->assertRunning($sub);
+
+        $original = $this->parseDay($closedDate);
+        $target = $this->parseDay($newDate);
+        $this->assertWithinEnd($sub, $target);
+
+        $weekdays = $sub->slots->pluck('weekday')->map(fn ($w) => (int) $w)->all();
+
+        if (! in_array($original->dayOfWeek, $weekdays, true) || $original->lt($sub->start_date)) {
+            throw new SubscriptionException('That is not one of this subscription\'s visit days.');
+        }
+
+        $originalDay = WorkDay::whereDate('work_date', $original->toDateString())->first();
+
+        if (! $originalDay) {
+            throw new SubscriptionException('We have no calendar entry for that date.');
+        }
+
+        if ($originalDay->is_open) {
+            throw new SubscriptionException('That date is open, so its visit is created automatically.');
+        }
+
+        if ($this->visitExists($sub, $originalDay)) {
+            throw new SubscriptionException('That visit has already been moved.');
+        }
+
+        $covered = $original->lte($sub->current_period_end);
+
+        try {
+            $visit = DB::transaction(function () use ($sub, $target, $originalDay, $original, $covered, $by, $reason) {
+                $newDay = $this->bookings->lockBookableDay($target, (int) $sub->cleaners_required, $sub->id);
+
+                $visit = $this->createVisit($sub, $newDay, $covered);
+                $visit->update(['rescheduled_from_work_day_id' => $originalDay->id, 'rescheduled_at' => now()]);
+                $visit->statusHistory()->create([
+                    'from_status' => $visit->status,
+                    'to_status' => $visit->status,
+                    'changed_by_user_id' => $by?->id,
+                    'note' => 'Make-up for '.$original->toDateString().' (closed)'.($reason ? ': '.$reason : ''),
+                ]);
+
+                $this->staffVisit($visit, $sub);
+
+                return $visit;
+            });
+        } catch (BookingException $e) {
+            throw new SubscriptionException($e->getMessage(), 0, $e);
+        }
+
+        return $visit->fresh();
+    }
+
+    private function assertRunning(Subscription $sub): void
+    {
+        if (! in_array($sub->status, ['active', 'past_due'], true) || ! $sub->current_period_end) {
+            throw new SubscriptionException('This subscription is not running.');
+        }
+    }
+
+    private function assertWithinEnd(Subscription $sub, Carbon $date): void
+    {
+        if ($sub->ends_at && $date->gt($sub->ends_at)) {
+            throw new SubscriptionException('That date is after this subscription ends.');
+        }
+    }
+
+    private function parseDay(mixed $value): Carbon
+    {
+        if (blank($value)) {
+            throw new SubscriptionException('Please choose a valid date.');
+        }
+
+        try {
+            return Carbon::parse((string) $value)->startOfDay();
+        } catch (\Throwable) {
+            throw new SubscriptionException('Please choose a valid date.');
+        }
+    }
+    
     // =====================================================================
     // Helpers
     // =====================================================================

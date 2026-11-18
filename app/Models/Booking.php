@@ -14,7 +14,7 @@ use Illuminate\Support\Facades\DB;
 
 #[Fillable([
     'reference', 'client_id', 'service_id', 'subscription_id', 'address_id', 'address_snapshot',
-    'zone_id', 'work_day_id', 'start_at', 'end_at', 'est_duration_minutes',
+    'zone_id', 'work_day_id', 'rescheduled_from_work_day_id', 'rescheduled_at', 'start_at', 'end_at', 'est_duration_minutes',
     'bedrooms', 'bathrooms', 'is_flat', 'multi_floor', 'has_bq', 'home_size_tier_id',
     'cleaners_recommended', 'cleaners_extra', 'cleaners_required',
     'off_limit_areas', 'special_instructions', 'assignment_mode', 'status', 'payment_status',
@@ -45,6 +45,7 @@ class Booking extends Model
             'has_bq' => 'boolean',
             'cancelled_at' => 'datetime',
             'completed_at' => 'datetime',
+            'rescheduled_at' => 'datetime',
         ];
     }
 
@@ -138,6 +139,11 @@ class Booking extends Model
     public function workDay(): BelongsTo
     {
         return $this->belongsTo(WorkDay::class);
+    }
+    
+     public function rescheduledFrom(): BelongsTo
+    {
+        return $this->belongsTo(WorkDay::class, 'rescheduled_from_work_day_id');
     }
 
     public function homeSizeTier(): BelongsTo
