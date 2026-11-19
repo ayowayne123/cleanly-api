@@ -20,11 +20,12 @@ class AuditLog extends Model
     }
 
     // One-line logging, e.g.:
-    // AuditLog::record('cleaner.off_day_changed', $cleaner, ['weekly_off_day' => 0], ['weekly_off_day' => 3]);
-    public static function record(string $action, Model $entity, ?array $old = null, ?array $new = null): self
+    // AuditLog::record('cleaner.off_day_changed', $cleaner, ['weekly_off_day' => 0], ['weekly_off_day' => 3], $admin);
+    // $by is who did it; when left out, the logged-in user is used.
+    public static function record(string $action, Model $entity, ?array $old = null, ?array $new = null, ?User $by = null): self
     {
         return static::create([
-            'user_id' => auth()->id(),
+            'user_id' => $by?->id ?? auth()->id(),
             'action' => $action,
             'entity_type' => $entity->getMorphClass(),
             'entity_id' => $entity->getKey(),
